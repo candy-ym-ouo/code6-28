@@ -3,7 +3,8 @@ import cors from 'cors';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { actors, actions, plays, towns, type Actor } from './content.js';
+import { actors, actions, plays, towns, type Actor, type Town } from './content.js';
+import { migrateFunds, planTravel, travelCost } from './rules.js';
 
 type Draft = { playId:string; assignments:Record<string,'main'|'support'|'rehearse'|'rest'>; timeline:{actionId:string; actorIds:string[]; act:number; slot:number}[]; endings:number[] };
 type Tour = { id:string; name:string; seed:number; status:string; townIds:string[]; stopIndex:number; funds:number; reputation:number; inspiration:number; version:number; actors:(Actor & {level:number;xp:number;stamina:number;fatigue:number})[]; visited:string[]; clues:Record<string,string[]>; draft?:Draft; history:any[]; unlocked:string[] };
@@ -11,17 +12,32 @@ const file = join(process.cwd(), 'data.json');
 let tours:Tour[] = existsSync(file) ? JSON.parse(readFileSync(file,'utf8')) : [];
 const performanceKeys=new Map<string,any>();
 let persistTimer:ReturnType<typeof setTimeout>|undefined; const persist=()=>{if(persistTimer)clearTimeout(persistTimer);persistTimer=setTimeout(()=>writeFileSync(file,JSON.stringify(tours,null,2)),120)};
+// 历史存档迁移：修正旧版本遗留的负资金（余额低于旅费仍可移动导致）。
+{
+  let migrated = false;
+  for (const t of tours) {
+    const r = migrateFunds(t.funds);
+    if (r.changed) { t.funds = r.funds; t.version++; migrated = true; }
+  }
+  if (migrated) persist();
+}
+// 给每个小镇附带权威旅费，前端不再自行计算，保证前后端口径一致。
+const withTravelCost=(list:Town[])=>list.map(x=>({...x,travelCost:travelCost(x)}));
 const app=express(); app.use(cors()); app.use(express.json({limit:'1mb'}));
 const ok=(res:any,data:any)=>res.json(data); const fail=(res:any,code:string,message:string,status=400)=>res.status(status).json({code,message});
 const getTour=(req:Request,res:Response):Tour|null=>{const t=tours.find(x=>x.id===req.params.id);if(!t){fail(res,'TOUR_NOT_FOUND','存档不存在',404);return null}return t};
 function town(t:Tour){return towns.find(x=>x.id===t.townIds[t.stopIndex])!}
 function route(seed:number){let state=(seed>>>0)||1;const shuffled=towns;for(let i=shuffled.length-1;i>0;i--){state=(state*1664525+1013904223)>>>0;const j=state%(i+1);[shuffled[i],shuffled[j]]=[shuffled[j],shuffled[i]]}return shuffled.slice(0,6).map(x=>x.id)}
 app.get('/health/live',(_,res)=>ok(res,{ok:true}));
-app.get('/api/v1/content/bootstrap',(_,res)=>ok(res,{actors,actions,plays,towns}));
+app.get('/api/v1/content/bootstrap',(_,res)=>ok(res,{actors,actions,plays,towns:withTravelCost(towns)}));
 app.get('/api/v1/tours',(_,res)=>ok(res,{tours:tours.map(t=>({id:t.id,name:t.name,status:t.status,stopIndex:t.stopIndex,funds:t.funds,reputation:t.reputation}))}));
 app.post('/api/v1/tours',(req,res)=>{const body=req.body??{};const name=String(body.name||'未命名剧团').trim().slice(0,24)||'未命名剧团';const seed=Number.isFinite(body.seed)?Number(body.seed):Math.floor(Math.random()*1000000); const t:Tour={id:randomUUID(),name,seed,status:'INVESTIGATING',townIds:route(seed),stopIndex:0,funds:420,reputation:50,inspiration:3,version:1,actors:actors.slice(0,3).map(a=>({...a,level:1,xp:0,stamina:a.stamina,fatigue:0})),visited:[],clues:{},history:[],unlocked:[]};tours.push(t);persist();ok(res,{tour:t})});
-app.get('/api/v1/tours/:id',(req,res)=>{const t=getTour(req,res);if(!t||!('id'in t))return; ok(res,{tour:t,town:town(t),plays,actions,towns})});
-app.post('/api/v1/tours/:id/travel',(req,res)=>{const t=getTour(req,res);if(!t||!('id'in t))return;if(t.status!=='ROUTE_SELECTION')return fail(res,'INVALID_TOUR_STATE','当前阶段不能移动',409);const next=String(req.body?.townId||'');if(t.townIds[t.stopIndex+1]!==next)return fail(res,'INVALID_ROUTE','请选择相邻路线');const target=towns.find(x=>x.id===next)!;const cost=Math.max(12,Math.round(target.capacity/8));if(t.funds<Math.round(target.capacity/8))return fail(res,'INSUFFICIENT_RESOURCE','资金不足以抵达下一站',422);t.funds-=cost;t.stopIndex++;t.status='INVESTIGATING';t.version++;persist();ok(res,{tour:t,town:target,cost})});
+app.get('/api/v1/tours/:id',(req,res)=>{const t=getTour(req,res);if(!t||!('id'in t))return; ok(res,{tour:t,town:town(t),plays,actions,towns:withTravelCost(towns)})});
+app.post('/api/v1/tours/:id/travel',(req,res)=>{const t=getTour(req,res);if(!t||!('id'in t))return;const next=String(req.body?.townId||'');const decision=planTravel(t,next);if(!decision.ok)return fail(res,decision.code,decision.message,decision.status);
+  // 先快照，扣款与推进状态任意一步失败都整体回滚，杜绝半移动/负资金。
+  const snapshot={funds:t.funds,stopIndex:t.stopIndex,status:t.status,version:t.version};
+  try{const{cost,target}=decision;t.funds-=cost;if(t.funds<0)throw new Error('negative funds after travel fee');t.stopIndex++;t.status='INVESTIGATING';t.version++;persist();ok(res,{tour:t,town:target,cost})}
+  catch(err){t.funds=snapshot.funds;t.stopIndex=snapshot.stopIndex;t.status=snapshot.status;t.version=snapshot.version;fail(res,'TRAVEL_ROLLED_BACK','移动失败，已回滚，资金未扣除',500)}});
 app.post('/api/v1/tours/:id/investigations',(req,res)=>{const t=getTour(req,res);if(!t||!('id'in t))return;if(t.status==='COMPLETED')return fail(res,'INVALID_TOUR_STATE','当前阶段不能调查',409);const cur=town(t);const kind=String(req.body?.kind||'');if(!['market','tavern','shrine','rehearse'].includes(kind))return fail(res,'VALIDATION_ERROR','未知调查类型');t.clues[cur.id]=Array.from(new Set([...(t.clues[cur.id]||[]),...cur.clues.slice(0,kind==='rehearse'?0:kind==='market'?1:kind==='tavern'?2:3)]));t.status='PREPARING';t.version++;persist();ok(res,{tour:t,clues:t.clues[cur.id]})});
 app.get('/api/v1/tours/:id/production',(req,res)=>{const t=getTour(req,res);if(!t||!('id'in t))return;ok(res,{draft:t.draft||{playId:plays[0].id,assignments:Object.fromEntries(t.actors.map(a=>[a.id,'main'])),timeline:[],endings:[0,0,0]},plays,actions,actors:t.actors})});
 function validate(t:Tour,d:Partial<Draft>){const errors:string[]=[];if(!d||typeof d!=='object')return {errors:['编排数据格式错误'],p:undefined};const p=plays.find(x=>x.id===d.playId);if(!p)errors.push('剧目不存在');const timeline=Array.isArray(d.timeline)?d.timeline:[];if(timeline.length===0)errors.push('至少安排一个木偶动作');const seen=new Set<string>();for(const e of timeline){if(!e||typeof e!=='object'){errors.push('动作数据格式错误');continue}const a=actions.find(x=>x.id===e.actionId);if(!a)errors.push('包含未知动作');if(!Number.isInteger(e.slot)||!Number.isInteger(e.act)||e.slot<0||e.slot>3||e.act<0||e.act>2)errors.push('动作位置超出时间轴');const ids=Array.isArray(e.actorIds)?e.actorIds:[];if(ids.length===0)errors.push('每个动作至少需要一名演员');for(const id of ids){if(!t.actors.some(actor=>actor.id===id))errors.push('包含未知演员');const occupied=`${id}-${e.act}-${e.slot+((a?.duration||1)-1)}`;if(seen.has(occupied))errors.push('同一演员存在时间冲突');seen.add(occupied)}}for(const a of t.actors){const used=timeline.filter(e=>Array.isArray(e?.actorIds)&&e.actorIds.includes(a.id)).reduce((n,e)=>n+(actions.find(x=>x.id===e.actionId)?.stamina||0),0);if(used>a.stamina+10)errors.push(`${a.name}体力不足`) }const endings=Array.isArray(d.endings)?d.endings:[];if(endings.length!==3||endings.some(x=>!Number.isInteger(x)||x<0||x>2))errors.push('结局选择不完整');return {errors,p}};
