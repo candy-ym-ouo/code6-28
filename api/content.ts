@@ -1,5 +1,7 @@
 export type Actor = { id:string; name:string; role:string; precision:number; acting:number; improvisation:number; stamina:number; trait:string; bio:string };
 export type Town = { id:string; name:string; region:string; legend:string; mood:string; audience:string; capacity:number; ticket:number; clues:string[] };
+// 旅费唯一口径：前后端展示、后端校验与扣费都必须使用此函数，最低 12
+export const travelCost=(town:Pick<Town,'capacity'>):number=>Math.max(12,Math.round(town.capacity/8));
 export type Play = { id:string; name:string; blurb:string; tags:string[]; acts:string[]; endings:string[] };
 export type Action = { id:string; name:string; category:string; duration:number; stamina:number; tags:string[]; description:string };
 export const actors:Actor[] = [
@@ -41,3 +43,5 @@ export const actions:Action[] = [
  {id:'chase',name:'追逐',category:'位移',duration:2,stamina:8,tags:['滑稽'],description:'节奏明快的舞台追逐。'},
  {id:'listen',name:'侧耳倾听',category:'表演',duration:1,stamina:2,tags:['神秘','哀思'],description:'让木偶听见传说的回声。'}
 ];
+// 历史存档迁移：资金不允许为负（早期校验口径错误会产生负余额），统一归零
+export const migrateLegacyFunds=<T extends {funds:number}>(tours:T[]):number=>{let migrated=0;for(const t of tours){if(!Number.isFinite(t.funds)||t.funds<0){t.funds=0;migrated++}}return migrated};
